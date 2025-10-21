@@ -273,6 +273,20 @@ class ColorDelegator(Delegator):
 
     def recolorize_main(self):
         "Evaluate text and apply colorizing tags."
+
+        # Shortcut for when we are recoloring everything
+        # Usually this happens when we open a file
+        todo_tag_range = self.tag_nextrange("TODO", "1.0")
+        if not todo_tag_range:
+            return None
+        start, end = todo_tag_range
+        if (start == "1.0") and self.compare(end, "==", "end"):
+            # Remove all tags
+            self.removecolors()
+            # Recolor everything
+            self._add_tags_in_section(self.get("1.0", "end"), "1.0")
+            return None
+
         next = "1.0"
         while todo_tag_range := self.tag_nextrange("TODO", next):
             self.tag_remove("SYNC", todo_tag_range[0], todo_tag_range[1])
@@ -340,14 +354,22 @@ class ColorDelegator(Delegator):
 
             `head` is the index in the text widget where the text is found.
         """
-        for m in self.prog.finditer(chars):
-            for name, matched_text in matched_named_groups(m):
-                a, b = m.span(name)
-                self._add_tag(a, b, head, name)
+        subtract_chars = 0
+        for match in self.prog.finditer(chars):
+            for name, matched_text in matched_named_groups(match):
+                start, end = match.span(name)
+                self._add_tag(start-subtract_chars, end-subtract_chars, head,
+                              name)
                 if matched_text in ("def", "class"):
-                    if m1 := self.idprog.match(chars, b):
-                        a, b = m1.span(1)
-                        self._add_tag(a, b, head, "DEFINITION")
+                    if new_match := self.idprog.match(chars, end):
+                        start, end = new_match.span(1)
+                        self._add_tag(start-subtract_chars, end-subtract_chars,
+                                      head, "DEFINITION")
+                # Move the head to where `end` points to
+                # Also keep track of how far we've moved head so that we
+                # can account for that next time we call `self._add_tag`
+                head = self.index(f"{head} +{end-subtract_chars:d}c")
+                subtract_chars = end
 
     def removecolors(self):
         "Remove all colorizing tags."
