@@ -232,18 +232,21 @@ class PyParser(Parser):
         elif token in "'\"":
             self.read_string("")
         elif token == "match":
+            line = self.curr_line_seen().rstrip(" \t")
             start = self.tell()
             self.skip()
-            if not self.curr_line_seen().rstrip(" \t"):
+            if not line:
                 self.skip_whitespaces()
                 if self.peek_token() not in NOT_AFTER_SOFT_KW | KEYWORDS:
                     self.set("KEYWORD", start)
         elif token == "case":
+            line = self.curr_line_seen().rstrip(" \t")
             start = self.tell()
             self.skip()
-            if not self.curr_line_seen().rstrip(" \t"):
+            if not line:
                 self.skip_whitespaces()
-                if self.peek_token() not in NOT_AFTER_SOFT_KW | KEYWORDS:
+                new_token = self.peek_token()
+                if new_token not in NOT_AFTER_SOFT_KW | KEYWORDS:
                     self.set("KEYWORD", start)
                     if new_token == "_":
                         self.set("KEYWORD")
@@ -550,18 +553,6 @@ class ColorDelegator(Delegator):
                     if DEBUG: print("colorizing stopped")
                     return
 
-    def _add_tag(self, start, end, head, matched_group_name):
-        """Add a tag to a given range in the text widget.
-
-        This is a utility function, receiving the range as `start` and
-        `end` positions, each of which is a number of characters
-        relative to the given `head` index in the text widget.
-
-        The tag to add is determined by `matched_group_name`, which is
-        the name of a regular expression "named group" as matched by
-        by the relevant highlighting regexps.
-        """
-
     def _add_tags_in_section(self, chars, head):
         """Parse and add highlighting tags to a given part of the text.
 
@@ -572,9 +563,9 @@ class ColorDelegator(Delegator):
         """
         subtract_chars = 0
         for start, end, tag in PyParser()._master_read(chars):
-            head = self.index(f"{head}+{start-subtract_chars:d}c")
-            subtract_chars = start
-            self.tag_add(tag, head, f"{head}+{end-subtract_chars:d}c")
+            end_index = self.index(f"{head}+{end-subtract_chars:d}c")
+            self.tag_add(tag, f"{head}+{start-subtract_chars:d}c", end_index)
+            head, subtract_chars = end_index, end
 
     def removecolors(self):
         "Remove all colorizing tags."
