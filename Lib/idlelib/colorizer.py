@@ -1,7 +1,9 @@
+from io import StringIO
 import builtins
 import keyword
-import re
+import bisect
 import time
+import re
 
 from idlelib.config import idleConf
 from idlelib.delegator import Delegator
@@ -9,73 +11,309 @@ from idlelib.delegator import Delegator
 DEBUG = False
 
 
-def any(name, alternates):
-    "Return a named group pattern matching list of alternates."
-    return "(?P<%s>" % name + "|".join(alternates) + ")"
+class Buffer(StringIO):
+    __slots__ = "total_data", "_newlines"
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.total_data = data
+        self._newlines = [0] + \
+                         [i for i,c in enumerate(data) if c == "\n"] + \
+                         [len(data)]
+
+    def peek(self, size):
+        location = super().tell()
+        return self.total_data[location:location+size]
+
+    def closest_newlines(self, index):
+        "Get the location of the closest newlines around `index`"
+        if not index:
+            return 0, self._newlines[1]
+        idx = bisect.bisect_left(self._newlines, index)
+        low_idx = idx - 1
+        while low_idx > 0:
+            start_text_idx = self._newlines[low_idx-1]
+            end_text_idx = self._newlines[low_idx]
+            line = self.total_data[start_text_idx:end_text_idx]
+            slashes = len(line) - len(line.rstrip("\\"))
+            if not (slashes&1): break
+            low_idx -= 1
+        return self._newlines[low_idx], self._newlines[idx]
+
+    def __bool__(self):
+        return super().tell() != len(self.total_data)
 
 
-def make_pat():
-    kw = r"\b" + any("KEYWORD", keyword.kwlist) + r"\b"
-    match_softkw = (
-        r"^[ \t]*" +  # at beginning of line + possible indentation
-        r"(?P<MATCH_SOFTKW>match)\b" +
-        r"(?![ \t]*(?:" + "|".join([  # not followed by ...
-            r"[:,;=^&|@~)\]}]",  # a character which means it can't be a
-                                 # pattern-matching statement
-            r"\b(?:" + r"|".join(keyword.kwlist) + r")\b",  # a keyword
-        ]) +
-        r"))"
-    )
-    case_default = (
-        r"^[ \t]*" +  # at beginning of line + possible indentation
-        r"(?P<CASE_SOFTKW>case)" +
-        r"[ \t]+(?P<CASE_DEFAULT_UNDERSCORE>_\b)"
-    )
-    case_softkw_and_pattern = (
-        r"^[ \t]*" +  # at beginning of line + possible indentation
-        r"(?P<CASE_SOFTKW2>case)\b" +
-        r"(?![ \t]*(?:" + "|".join([  # not followed by ...
-            r"_\b",  # a lone underscore
-            r"[:,;=^&|@~)\]}]",  # a character which means it can't be a
-                                 # pattern-matching case
-            r"\b(?:" + r"|".join(keyword.kwlist) + r")\b",  # a keyword
-        ]) +
-        r"))"
-    )
-    builtinlist = [str(name) for name in dir(builtins)
-                   if not name.startswith('_') and
-                   name not in keyword.kwlist]
-    builtin = r"([^.'\"\\#]\b|^)" + any("BUILTIN", builtinlist) + r"\b"
-    comment = any("COMMENT", [r"#[^\n]*"])
-    stringprefix = r"(?i:r|u|f|fr|rf|b|br|rb|t|rt|tr)?"
-    sqstring = stringprefix + r"'[^'\\\n]*(\\.[^'\\\n]*)*'?"
-    dqstring = stringprefix + r'"[^"\\\n]*(\\.[^"\\\n]*)*"?'
-    sq3string = stringprefix + r"'''[^'\\]*((\\.|'(?!''))[^'\\]*)*(''')?"
-    dq3string = stringprefix + r'"""[^"\\]*((\\.|"(?!""))[^"\\]*)*(""")?'
-    string = any("STRING", [sq3string, dq3string, sqstring, dqstring])
-    prog = re.compile("|".join([
-                                builtin, comment, string, kw,
-                                match_softkw, case_default,
-                                case_softkw_and_pattern,
-                                any("SYNC", [r"\n"]),
-                               ]),
-                      re.DOTALL | re.MULTILINE)
-    return prog
+REPLACE_LINE_CONTINUATIONS = re.compile(
+    r"[ \t]*" +      # Any white spaces, followed by
+    r"(?<!\\)" +     # Not followed by a slash, followed by
+    r"((?:\\\\)*)" + # An even number of slashes, followed by
+    r"\\\n" +        # A slash and a newline, followed by
+    r"[ \t]*"        # Any indentation
+)
 
 
-prog = make_pat()
-idprog = re.compile(r"\s+(\w+)")
-prog_group_name_to_tag = {
-    "MATCH_SOFTKW": "KEYWORD",
-    "CASE_SOFTKW": "KEYWORD",
-    "CASE_DEFAULT_UNDERSCORE": "KEYWORD",
-    "CASE_SOFTKW2": "KEYWORD",
-}
+class Parser:
+    __slots__ = "_under", "_overrides", "_start_size_map", "_peeked_token"
+
+    def __bool__(self):
+        "Test if there are any tokens left in the buffer"
+        return bool(self._peeked_token or self._under)
+
+    def curr_line_seen(self):
+        "Get the text on the current line that has been read already."
+        curr = self.tell()
+        start, end = self._under.closest_newlines(curr)
+        end = end if curr is None else curr
+        text = self._under.total_data[start:end].removeprefix("\n")
+        if "\n" in text:
+            text = REPLACE_LINE_CONTINUATIONS.sub(r"\1", text)
+        return text
+
+    def tell(self):
+        # Subtract the peeked token because it was actually read not peeked
+        return self._under.tell() - len(self._peeked_token or "")
+
+    def peek_token(self):
+        "Peek a token (indentation/identifier/number/any other character)"
+        if self._peeked_token is None:
+            start = self._under.tell()
+            self._peeked_token = self._pure_read_token()
+            if not self._peeked_token: return ""
+            self._start_size_map.append((start,len(self._peeked_token)))
+            self._overrides[start] = "SYNC"*(self._peeked_token == "\n")
+        return self._peeked_token
+
+    def skip_whitespaces(self, whitespaces):
+        while self and (not self.peek_token().strip(whitespaces)):
+            self.skip()
+
+    def _pure_read_token(self):
+        output = self._under.read(1)
+        if output:
+            if output in " \t":
+                while True:
+                    if self._under.peek(1) not in " \t": break
+                    output += self._under.read(1)
+                return output
+            elif output.isidentifier():
+                while (output + self._under.peek(1)).isidentifier():
+                    output += self._under.read(1)
+                return output
+            elif output.isdigit():
+                # Note that leading -/+ signs aren't part of the token
+                while (output + self._under.peek(1)).isdigit():
+                    output += self._under.read(1)
+                return output
+        return output
+
+    def set(self, tokentype, index=None):
+        """
+        Set the token at `index`'s type as `tokentype`. If index is `None`,
+        `index` is assumed to be `self.tell()`.
+        If `index` is `None` or at `self.tell()`, it sets the tokentype and
+        moves the buffer forward
+        """
+        curr = self.tell()
+        if index is None:
+            index = curr
+        self._overrides[index] = tokentype
+        if index == curr:
+            self.skip()
+
+    def set_from(self, replace_tokentype, start, *, ignoretypes=()):
+        """
+        Replace all tokentypes from `start` until `self.tell()` with
+        `replace_tokentype` if the tokentype is not in `ignoretypes`
+        """
+        end = self.tell()
+        while start < end:
+            if not (ignoretypes and (self._overrides[start] in ignoretypes)):
+                self.set(replace_tokentype, start)
+            start = self.next_start(start)
+
+    def skip(self):
+        "Skip a token"
+        self._peeked_token = None
+        self.peek_token()
+
+    def next_start(self, start):
+        """
+        Returns the location where the next token starts. The token must
+        have been read by `self.read()` first otherwise it returns `None`
+        """
+        if self._start_size_map[-1][0] < start: return None
+        idx = bisect.bisect_left(self._start_size_map, (start,))
+        if self._start_size_map[idx][0] != start:
+            raise IndexError("Invalid token start location")
+        return sum(self._start_size_map[idx])
+
+    def read_wait_for(self, tokens, settype=None, *, ignoretypes=()):
+        """
+        Calls `self.read()` until the next token is in the `tokens` iterable
+          passed in. If `settype` is passed in, this function behaves like
+          `set_from` for all of the tokens read (excluding the returned one)
+        Returns the next token (guaranteed to be empty or one of `tokens`)
+        """
+        waiting_for_newline = "\n" in tokens
+        while True:
+            token = self.peek_token()
+            if (token in tokens) or (not token):
+                return token
+            elif token == "\n" and (not waiting_for_newline):
+                self.set(f"no-sync-{settype}")
+            else:
+                if settype is None:
+                    self.read()
+                else:
+                    start = self.tell()
+                    self.read()
+                    self.set_from(settype, start, ignoretypes=ignoretypes)
+
+    def _master_read(self, text):
+        assert text.endswith("\n"), "self._pure_read_token might loop forever"
+        # Reset
+        self._overrides = {}
+        self._start_size_map = []
+        self._peeked_token = None
+        self._under = Buffer(text)
+        # Read tokens
+        while self.peek_token(): self.read()
+        assert self.tell() == len(text), "InternalError"
+        # Merge and yield overrides
+        max_idx = len(self._start_size_map)
+        idx = 0
+        while idx < max_idx:
+            # Get info
+            start, size = self._start_size_map[idx]
+            tokentype = self._overrides[start]
+            end = start + size
+            idx += 1
+            if not tokentype: continue
+            while tokentype == self._overrides.get(end, None):
+                end += self._start_size_map[idx][1]
+                idx += 1
+            yield start, end, tokentype
+        assert end == len(self._under.total_data), "InternalError"
 
 
-def matched_named_groups(re_match):
-    "Get only the non-empty named groups from an re.Match object."
-    return ((k, v) for (k, v) in re_match.groupdict().items() if v)
+CMD_KWS = frozenset({"assert", "with", "async", "def", "class", "break",
+                    "continue", "del", "elif", "try", "except", "finally",
+                    "from", "import", "nonlocal", "global", "pass", "raise",
+                    "return", "while", "for"})
+SPACES = " \t"
+STRING_PREFIXES = frozenset({"r","u","f","t","b","fr","rf","tr","rt","br","rb"})
+KEYWORDS = frozenset(keyword.kwlist)
+BUILTINS = frozenset({name for name in dir(builtins)
+                      if not name.startswith("_") and name not in KEYWORDS})
+
+
+class PyParser(Parser):
+    __slots__ = ()
+
+    def read(self):
+        token = self.peek_token()
+        if not token: return None
+        if token in KEYWORDS:
+            self.set("KEYWORD")
+            if token in ("def", "class"):
+                self.skip_whitespaces(SPACES)
+                if self.peek_token().isidentifier():
+                    self.set("DEFINITION")
+        elif token in BUILTINS:
+            if self.curr_line_seen()[-1:] == ".":
+                self.skip()
+            else:
+                self.set("BUILTIN")
+        elif token == "#":
+            self.set("COMMENT")
+            while self.peek_token() != "\n":
+                self.set("COMMENT")
+        elif token.lower() in STRING_PREFIXES:
+            start = self.tell()
+            self.skip()
+            new_token = self.peek_token()
+            if new_token in ("'", '"'):
+                self.set("STRING", start)
+                self.read_string(token)
+        elif token in ("'", '"'):
+            self.read_string()
+        elif token == "match":
+            if self.curr_line_seen().rstrip(" \t"):
+                self.skip()
+            else:
+                start = self.tell()
+                self.skip()
+                self.skip_whitespaces(SPACES)
+                new_token = self.peek_token()
+                if new_token not in set(":,;=^&|@~)]}") | KEYWORDS:
+                    self.set("KEYWORD", start)
+        elif token == "case":
+            if self.curr_line_seen().rstrip(" \t"):
+                self.skip()
+            else:
+                start = self.tell()
+                self.skip()
+                self.skip_whitespaces(SPACES)
+                new_token = self.peek_token()
+                if new_token not in set(":,;=^&|@~)]}") | KEYWORDS:
+                    self.set("KEYWORD", start)
+                    if new_token == "_":
+                        self.set("KEYWORD")
+        elif token == "\\":
+            self.skip()
+            token = self.peek_token()
+            if token == "\n":
+                self.set("no-sync-backslash")
+            elif token == "\\":
+                self.skip()
+        else:
+            self.skip()
+
+    def read_string(self, prefix=""):
+        fstring = "f" in prefix
+        single = self.peek_token()
+        self.set("STRING")
+        triple = False
+        if self.peek_token() == single:
+            self.set("STRING")
+            if self.peek_token() != single:
+                return None
+            self.set("STRING")
+            triple = True
+        while True:
+            token = self.peek_token()
+            if not token:
+                break
+            elif (not triple) and (token == "\n"):
+                break
+            elif token == "\\":
+                self.set("STRING")
+                if fstring and (self.peek_token() in "{}"):
+                    continue
+                self.set("STRING")
+            elif token == single:
+                self.set("STRING")
+                if not triple: break
+                if self.peek_token() == single:
+                    self.set("STRING")
+                    if self.peek_token() == single:
+                        self.set("STRING")
+                        break
+            elif fstring and (token == "{"):
+                self.set("STRING")
+                if self.peek_token() == "{":
+                    self.set("STRING")
+                    continue
+                start = self.tell()
+                token = self.read_wait_for({"}"} | CMD_KWS)
+                self.set_from("STRING", start)
+                if token == "}":
+                    self.set("STRING")
+                else:
+                    return None
+            else:
+                self.set("STRING")
 
 
 def color_config(text):
@@ -118,8 +356,6 @@ class ColorDelegator(Delegator):
     def __init__(self):
         Delegator.__init__(self)
         self.init_state()
-        self.prog = prog
-        self.idprog = idprog
         self.LoadTagDefs()
 
     def init_state(self):
@@ -273,6 +509,18 @@ class ColorDelegator(Delegator):
 
     def recolorize_main(self):
         "Evaluate text and apply colorizing tags."
+
+        # Shortcut for when we are recoloring everything
+        # Usually this happens when we open a file
+        todo_tag_range = self.tag_nextrange("TODO", "1.0")
+        if not todo_tag_range:
+            return None
+        start, end = todo_tag_range
+        if (start == "1.0") and self.compare(end, "==", "end"):
+            self.removecolors()
+            self._add_tags_in_section(self.get("1.0", "end"), "1.0")
+            return None
+
         next = "1.0"
         while todo_tag_range := self.tag_nextrange("TODO", next):
             self.tag_remove("SYNC", todo_tag_range[0], todo_tag_range[1])
@@ -326,11 +574,6 @@ class ColorDelegator(Delegator):
         the name of a regular expression "named group" as matched by
         by the relevant highlighting regexps.
         """
-        tag = prog_group_name_to_tag.get(matched_group_name,
-                                         matched_group_name)
-        self.tag_add(tag,
-                     f"{head}+{start:d}c",
-                     f"{head}+{end:d}c")
 
     def _add_tags_in_section(self, chars, head):
         """Parse and add highlighting tags to a given part of the text.
@@ -338,16 +581,13 @@ class ColorDelegator(Delegator):
         `chars` is a string with the text to parse and to which
         highlighting is to be applied.
 
-            `head` is the index in the text widget where the text is found.
+        `head` is the index in the text widget where the text is found.
         """
-        for m in self.prog.finditer(chars):
-            for name, matched_text in matched_named_groups(m):
-                a, b = m.span(name)
-                self._add_tag(a, b, head, name)
-                if matched_text in ("def", "class"):
-                    if m1 := self.idprog.match(chars, b):
-                        a, b = m1.span(1)
-                        self._add_tag(a, b, head, "DEFINITION")
+        subtract_chars = 0
+        for start, end, tag in PyParser()._master_read(chars):
+            head = self.index(f"{head}+{start-subtract_chars:d}c")
+            subtract_chars = start
+            self.tag_add(tag, head, f"{head}+{end-subtract_chars:d}c")
 
     def removecolors(self):
         "Remove all colorizing tags."
