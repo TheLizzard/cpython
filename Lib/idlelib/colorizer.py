@@ -54,7 +54,7 @@ REPLACE_LINE_CONTINUATIONS = re.compile(
 
 
 class Parser:
-    __slots__ = "_under", "_overrides", "_start_size_map", "_peeked_token"
+    __slots__ = "_under", "_tags", "_start_size_map", "_peeked_token"
 
     def __bool__(self):
         "Test if there are any tokens left in the buffer"
@@ -81,11 +81,11 @@ class Parser:
             self._peeked_token = self._pure_read_token()
             if not self._peeked_token: return ""
             self._start_size_map.append((start,len(self._peeked_token)))
-            self._overrides[start] = "SYNC"*(self._peeked_token == "\n")
+            self._tags[start] = "SYNC"*(self._peeked_token == "\n")
         return self._peeked_token
 
-    def skip_whitespaces(self, whitespaces):
-        while self and (not self.peek_token().strip(whitespaces)):
+    def skip_whitespaces(self):
+        while self and (not self.peek_token().strip(" \t")):
             self.skip()
 
     def _pure_read_token(self):
@@ -117,7 +117,7 @@ class Parser:
         curr = self.tell()
         if index is None:
             index = curr
-        self._overrides[index] = tokentype
+        self._tags[index] = tokentype
         if index == curr:
             self.skip()
 
@@ -127,26 +127,17 @@ class Parser:
         `replace_tokentype` if the tokentype is not in `ignoretypes`
         """
         end = self.tell()
+        idx = bisect.bisect_left(self._start_size_map, (start,))
         while start < end:
-            if not (ignoretypes and (self._overrides[start] in ignoretypes)):
+            if not (ignoretypes and (self._tags[start] in ignoretypes)):
                 self.set(replace_tokentype, start)
-            start = self.next_start(start)
+            start = sum(self._start_size_map[idx])
+            idx += 1
 
     def skip(self):
         "Skip a token"
         self._peeked_token = None
         self.peek_token()
-
-    def next_start(self, start):
-        """
-        Returns the location where the next token starts. The token must
-        have been read by `self.read()` first otherwise it returns `None`
-        """
-        if self._start_size_map[-1][0] < start: return None
-        idx = bisect.bisect_left(self._start_size_map, (start,))
-        if self._start_size_map[idx][0] != start:
-            raise IndexError("Invalid token start location")
-        return sum(self._start_size_map[idx])
 
     def read_wait_for(self, tokens, settype=None, *, ignoretypes=()):
         """
@@ -155,12 +146,11 @@ class Parser:
           `set_from` for all of the tokens read (excluding the returned one)
         Returns the next token (guaranteed to be empty or one of `tokens`)
         """
-        waiting_for_newline = "\n" in tokens
         while True:
             token = self.peek_token()
             if (token in tokens) or (not token):
                 return token
-            elif token == "\n" and (not waiting_for_newline):
+            elif token == "\n":
                 self.set(f"no-sync-{settype}")
             else:
                 if settype is None:
@@ -173,24 +163,24 @@ class Parser:
     def _master_read(self, text):
         assert text.endswith("\n"), "self._pure_read_token might loop forever"
         # Reset
-        self._overrides = {}
+        self._under = Buffer(text)
         self._start_size_map = []
         self._peeked_token = None
-        self._under = Buffer(text)
+        self._tags = {}
         # Read tokens
         while self.peek_token(): self.read()
         assert self.tell() == len(text), "InternalError"
-        # Merge and yield overrides
+        # Merge and yield tags
         max_idx = len(self._start_size_map)
         idx = 0
         while idx < max_idx:
             # Get info
             start, size = self._start_size_map[idx]
-            tokentype = self._overrides[start]
+            tokentype = self._tags[start]
             end = start + size
             idx += 1
             if not tokentype: continue
-            while tokentype == self._overrides.get(end, None):
+            while tokentype == self._tags.get(end, None):
                 end += self._start_size_map[idx][1]
                 idx += 1
             yield start, end, tokentype
@@ -201,7 +191,7 @@ CMD_KWS = frozenset({"assert", "with", "async", "def", "class", "break",
                     "continue", "del", "elif", "try", "except", "finally",
                     "from", "import", "nonlocal", "global", "pass", "raise",
                     "return", "while", "for"})
-SPACES = " \t"
+NOT_AFTER_SOFT_KW = frozenset(":,;=^&|@~)]}")
 STRING_PREFIXES = frozenset({"r","u","f","t","b","fr","rf","tr","rt","br","rb"})
 KEYWORDS = frozenset(keyword.kwlist)
 BUILTINS = frozenset({name for name in dir(builtins)
@@ -217,46 +207,43 @@ class PyParser(Parser):
         if token in KEYWORDS:
             self.set("KEYWORD")
             if token in ("def", "class"):
-                self.skip_whitespaces(SPACES)
+                self.skip_whitespaces()
                 if self.peek_token().isidentifier():
                     self.set("DEFINITION")
         elif token in BUILTINS:
-            if self.curr_line_seen()[-1:] == ".":
+            if self.curr_line_seen().rstrip(" \t")[-1:] == ".":
                 self.skip()
             else:
                 self.set("BUILTIN")
+        elif token == "{":
+            self.skip()
+            if self.read_wait_for("}") == "}":
+                self.skip()
         elif token == "#":
-            self.set("COMMENT")
             while self.peek_token() != "\n":
                 self.set("COMMENT")
         elif token.lower() in STRING_PREFIXES:
             start = self.tell()
             self.skip()
             new_token = self.peek_token()
-            if new_token in ("'", '"'):
+            if new_token in "'\"":
                 self.set("STRING", start)
                 self.read_string(token)
-        elif token in ("'", '"'):
-            self.read_string()
+        elif token in "'\"":
+            self.read_string("")
         elif token == "match":
-            if self.curr_line_seen().rstrip(" \t"):
-                self.skip()
-            else:
-                start = self.tell()
-                self.skip()
-                self.skip_whitespaces(SPACES)
-                new_token = self.peek_token()
-                if new_token not in set(":,;=^&|@~)]}") | KEYWORDS:
+            start = self.tell()
+            self.skip()
+            if not self.curr_line_seen().rstrip(" \t"):
+                self.skip_whitespaces()
+                if self.peek_token() not in NOT_AFTER_SOFT_KW | KEYWORDS:
                     self.set("KEYWORD", start)
         elif token == "case":
-            if self.curr_line_seen().rstrip(" \t"):
-                self.skip()
-            else:
-                start = self.tell()
-                self.skip()
-                self.skip_whitespaces(SPACES)
-                new_token = self.peek_token()
-                if new_token not in set(":,;=^&|@~)]}") | KEYWORDS:
+            start = self.tell()
+            self.skip()
+            if not self.curr_line_seen().rstrip(" \t"):
+                self.skip_whitespaces()
+                if self.peek_token() not in NOT_AFTER_SOFT_KW | KEYWORDS:
                     self.set("KEYWORD", start)
                     if new_token == "_":
                         self.set("KEYWORD")
@@ -270,7 +257,7 @@ class PyParser(Parser):
         else:
             self.skip()
 
-    def read_string(self, prefix=""):
+    def read_string(self, prefix):
         fstring = "f" in prefix
         single = self.peek_token()
         self.set("STRING")
