@@ -191,7 +191,7 @@ CMD_KWS = frozenset({"assert", "with", "async", "def", "class", "break",
                     "continue", "del", "elif", "try", "except", "finally",
                     "from", "import", "nonlocal", "global", "pass", "raise",
                     "return", "while", "for"})
-NOT_AFTER_SOFT_KW = frozenset(":,;=^&|@~)]}")
+NOT_AFTER_SOFT_KW = frozenset(":,;=^&|@~)]}.")
 STRING_PREFIXES = frozenset({"r","u","f","t","b","fr","rf","tr","rt","br","rb"})
 KEYWORDS = frozenset(keyword.kwlist)
 BUILTINS = frozenset({name for name in dir(builtins)
